@@ -1,0 +1,5 @@
+# BFCL evaluation and vLLM serving (separate environment: vLLM 0.8.5 needs transformers 4.51)
+# then install BFCL from source: gorilla commit f7cf735, berkeley-function-call-leaderboard, pip install -e ".[oss_eval_vllm]"
+vllm==0.8.5
+transformers==4.51.3
+soundfile
