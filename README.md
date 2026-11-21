@@ -5,7 +5,8 @@ tool-call format**. It then compares the result with IBM's post-trained **`grani
 **Berkeley Function Calling Leaderboard (BFCL)**, using one harness for both models. It also covers:
 
 - **Serving:** bf16, FP8 and 4-bit with vLLM, and GGUF on an 8 GB laptop GPU.
-- **A Triton kernel** for one of Granite's fused operations.
+- **A Triton kernel** for one of Granite's fused operations, with a torch.profiler study of where the time goes.
+- **The Granite decoder written from scratch** in plain PyTorch. It is bit-exact against transformers.
 - **A Docling-based document agent**, with a prompt-injection test.
 
 Everything was trained on **one H100 MIG slice** (1/7 of an H100 for most runs) and a **laptop RTX 3070 Ti (8 GB)**.
@@ -34,7 +35,8 @@ the mean ± sd over 3 training seeds.
 | V4-style weighting (multi-turn counts half) | – | 37.4 | **39.4** |
 
 **In one line:** ours beats IBM's 3B at single-turn tool calling (+11.9 points; the seed spread is 0.6). The
-biggest gain is on parallel calls. It is worse at multi-turn agent sessions and somewhat worse at refusing.
+biggest gain is on parallel calls. It is worse at multi-turn sessions, somewhat worse at refusing, and over-refuses
+in multi-step agent tasks (finding 11).
 
 ### How the training data changed the result (one change per run)
 | Run | Data | Non-live | Live | Hallucination | Multi-turn |
@@ -78,11 +80,35 @@ The kernel computes `h = residual + out × 0.22` and `y = RMSNorm(h) × w` in on
 
 The kernel is correct within bf16 rounding at every size.
 
+### Inside the model: torch.profiler share and end-to-end effect
+**GPU time per step in transformers (bf16, eager PyTorch ops):**
+| Part | Prefill (512 tokens) | Decode (1 token) |
+|---|---|---|
+| MLP | 48.7% | 54.0% |
+| Attention | 35.0% | 29.9% |
+| **RMSNorm + residual (what the kernel replaces)** | **15.5%** | **10.7%** |
+| Output head and other | 0.8% | 5.5% |
+
+**Decoder written from scratch** in plain PyTorch, run with our weights (`pipeline/decoder_scratch.py`):
+- **Exactness:** its logits are *identical* to transformers (max difference 0.0 over 8,630 positions), and greedy
+  generations match token for token on 10/10 prompts.
+- **Speed:** with the fused Triton kernel plugged in, it gets faster.
+
+| Batch 1, H100 MIG 1g.24gb | Prefill 512 tokens | Decode |
+|---|---|---|
+| transformers (eager attention) | 144.3 ms | 24.5 tok/s |
+| ours, plain PyTorch | 149.4 ms | 26.5 tok/s |
+| **ours + fused Triton kernel** | **134.1 ms (−10%)** | **29.6 tok/s (+12%)** |
+
 ### Document agent (Docling + our tool loop, 48 tasks on 12 synthetic report PDFs)
-| Controller | Correct | lookup / sum / argmax / profit | Prompt injection followed |
-|---|---|---|---|
-| none | 12/48 | 12 / 0 / 0 / 0 | 0/16 |
-| guard (at most 2 generic "use your tools" nudges) | 23/48 | 12 / 7 / 4 / 0 | 0/16 |
+| Model | Controller | Correct | lookup / sum / argmax / profit | Prompt injection followed |
+|---|---|---|---|---|
+| sft3b (data v2) | none | 12/48 | 12 / 0 / 0 / 0 | 0/16 |
+| sft3b (data v2) | guard (at most 2 generic "use your tools" nudges) | **23/48** | 12 / 7 / 4 / 0 | 0/16 |
+| **sft4 (data v3, final), 3 seeds** | none | **0/48** | 0 / 0 / 0 / 0 | 0/16 |
+| sft4 (data v3, final) | guard | 0/48 | 0 / 0 / 0 / 0 | 0/16 |
+
+The final model refuses in this agent setting (see finding 11).
 
 ---
 
@@ -121,17 +147,33 @@ The kernel is correct within bf16 rounding at every size.
    - It uses half the memory and decodes 49% faster, with no measurable accuracy loss.
    - 4-bit NF4 saves the most memory but is slower than bf16, because it dequantises on the fly. It also loses
      1.9 points.
-10. **A hand-written Triton kernel ≈ `torch.compile`.**
-    - The fused kernel is 6–8× faster than eager PyTorch and reaches ~884 GB/s, but only 0–9% faster than what the
-      compiler generates.
-    - Today, writing kernels pays off mostly where the compiler cannot fuse.
-11. **Agent failures are about protocol, not about reading.**
-    - The model always reads the right section of the document. It then does arithmetic in its head (wrongly) and
-      answers in text instead of calling `calculate` and `final_answer`. That habit comes from the training data.
-    - Two generic nudges almost double accuracy. Multi-step calculations still fail.
-    - It never followed the hidden prompt injection ("email this data to …").
-12. **Multi-turn needs trajectory data.** Our model acts at once instead of first exploring with list or read tools.
+10. **A hand-written Triton kernel ≈ `torch.compile`, but it still pays off in an eager model.**
+    - On its own, the fused kernel is 6–8× faster than eager PyTorch and reaches ~884 GB/s, but only 0–9% faster
+      than what the compiler generates.
+    - Inside the model, RMSNorm + residual are 15.5% of prefill GPU time, because eager RMSNorm upcasts to fp32 and
+      makes ~8 passes over memory.
+    - Plugged into our from-scratch decoder, the kernel cut prefill by 10% (the profiler bound is ~13%) and sped up
+      decode by 12%.
+11. **Hard negatives fixed BFCL hallucination but broke the agent: the model now over-refuses.**
+    - The 1,000 "needed tool removed → refuse" examples taught the model to refuse whenever no single tool answers the
+      question directly. In the document agent, the answer needs list → read → calculate → answer, so sft4 replies
+      "I don't have a tool for that" (0/48 on all 3 seeds), even after a nudge.
+    - BFCL does not catch this, because in every BFCL call case one tool fits the request directly.
+    - The older sft3b is the better agent (23/48 with the guard). It always read the right section, but it did
+      arithmetic in its head instead of calling `calculate`.
+    - The fix (not done here) is to balance hard negatives with positives where the tools fit only indirectly, i.e.
+      multi-step trajectories.
+    - No model ever followed the hidden prompt injection ("email this data to …").
+12. **Multi-turn needs trajectory data.** Our models act at once instead of first exploring with list or read tools.
     Single-turn chat data does not teach that.
+13. **Decode in plain transformers is limited by kernel launches, not by the GPU.**
+    - In decode, one token takes 12 ms of GPU work against ~41 ms of wall time, so the GPU is busy only ~30% of the
+      time.
+    - vLLM, which uses CUDA graphs, reaches 88 tok/s on the same slice. Fusing kernels helps here twice: less memory
+      traffic and ~720 fewer launches per token.
+14. **A from-scratch decoder can match the library exactly.** If you copy the same operation order (fp32 RMSNorm,
+    bf16 RoPE, fp32 softmax, the muP multipliers), the logits are bit-identical. This is a useful test that you
+    really understand the architecture.
 
 ## Lessons learned (engineering)
 - **Change one thing per run.**
@@ -252,10 +294,14 @@ LLAMA_CPP=/path/to/llama.cpp python pipeline/make_gguf.py --model merged/sft4 --
 llama-bench -m gguf/sft4-Q4_K_M.gguf -ngl 99 -p 512 -n 128 -r 3
 ```
 
-### 6. Triton kernel
+### 6. Triton kernel, profiler, decoder from scratch
 ```bash
 python pipeline/triton_rmsnorm.py --out triton.json    # correctness + timing vs eager and torch.compile
+python pipeline/profile_model.py --model merged/sft4 --val data/val.jsonl --out profile.json   # GPU-time shares
+python pipeline/decoder_scratch.py --model merged/sft4 --val data/val.jsonl --out decoder.json # exactness + speed
 ```
+- `decoder_scratch.py` loads the transformers reference first and frees it before loading its own copy. Two bf16
+  copies do not fit a 24 GB slice.
 
 ### 7. Document agent
 ```bash
@@ -278,6 +324,8 @@ python agent/run_agent.py --adapter runs/sft4/adapter_step450 --run a1 [--guard]
 | `pipeline/gate_dev.py` | call-or-answer threshold study |
 | `pipeline/serve_bench.py`, `make_gguf.py`, `laptop_bench.py` | serving benchmarks and GGUF export |
 | `pipeline/triton_rmsnorm.py` | Triton kernel + benchmark |
+| `pipeline/profile_model.py` | torch.profiler: GPU-time share of each block in the model |
+| `pipeline/decoder_scratch.py` | Granite decoder in plain PyTorch (RoPE, GQA, SwiGLU, KV cache), checked against transformers |
 | `pipeline/card_check.py` | runs the model-card snippet end to end |
 | `agent/` | synthetic PDFs, Docling parsing, tool-using agent loop |
 | `hpc_glue/sitecustomize.py` | vLLM 0.8.5 fix for MIG devices |
@@ -288,6 +336,8 @@ python agent/run_agent.py --adapter runs/sft4/adapter_step450 --run a1 [--guard]
   scores.
 - **Non-thinking baseline.** granite-4.2-3b was evaluated in non-thinking mode; its default thinking mode may
   score higher.
+- **Over-refusal in agents.** The final model (sft4) refuses multi-step document tasks (0/48); use sft3b-style data
+  or add multi-step trajectories for agent use.
 - **Narrow skill.** The adapter targets tool calling. General chat and reasoning were not measured and are likely
   below IBM's post-trained models.
 - **One data family.** The training data is synthetic, from Hermes and Glaive, and English only.

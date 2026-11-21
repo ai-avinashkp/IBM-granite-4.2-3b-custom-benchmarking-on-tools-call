@@ -112,8 +112,9 @@ def main():
     ap.add_argument("--max-steps", type=int, default=8)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--guard", action="store_true")      # controller: re-prompt on protocol violations
+    ap.add_argument("--out", default=None)                # traces folder; default agent/traces/<run>/
     a = ap.parse_args()
-    out = HERE / "traces" / a.run
+    out = Path(a.out) if a.out else HERE / "traces" / a.run
     out.mkdir(parents=True, exist_ok=True)
 
     tok = AutoTokenizer.from_pretrained("ibm-granite/granite-4.2-3b")
